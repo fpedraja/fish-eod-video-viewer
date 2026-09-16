@@ -211,7 +211,11 @@ class EODPanel(QWidget):
         top = QHBoxLayout()
         top.addWidget(QLabel("EOD view:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Event times (dots)", "Instantaneous frequency"])
+        self.mode_combo.addItems([
+            "Event times (dots)",
+            "Instantaneous frequency",
+            "DIEODI (dot size = IEI)",
+        ])
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         top.addWidget(self.mode_combo)
 
@@ -245,7 +249,7 @@ class EODPanel(QWidget):
         self._yrange_row = QWidget()
         yrow = QHBoxLayout(self._yrange_row)
         yrow.setContentsMargins(0, 0, 0, 0)
-        self.lock_y_check = QCheckBox("Lock Y range (Hz)")
+        self.lock_y_check = QCheckBox("Lock Y range")
         self.lock_y_check.setStyleSheet("color:#abb2bf;")
         self.lock_y_check.stateChanged.connect(self._update_freq_yrange)
         yrow.addWidget(self.lock_y_check)
@@ -253,17 +257,19 @@ class EODPanel(QWidget):
         self.ymin_spin = QDoubleSpinBox()
         self.ymax_spin = QDoubleSpinBox()
         for sp in (self.ymin_spin, self.ymax_spin):
-            sp.setRange(0.0, 100000.0)
+            sp.setRange(-100000.0, 100000.0)
             sp.setSingleStep(1.0)
-            sp.setDecimals(1)
+            sp.setDecimals(3)
             sp.valueChanged.connect(self._update_freq_yrange)
         self.ymax_spin.setValue(100.0)
         yrow.addWidget(self.ymin_spin)
         yrow.addWidget(QLabel("Max:"))
         yrow.addWidget(self.ymax_spin)
 
-        yrow.addSpacing(20)
-        yrow.addWidget(QLabel("Max plausible (Hz):"))
+        self._plausible_widget = QWidget()
+        pw = QHBoxLayout(self._plausible_widget)
+        pw.setContentsMargins(20, 0, 0, 0)
+        pw.addWidget(QLabel("Max plausible (Hz):"))
         self.max_plausible_spin = QDoubleSpinBox()
         self.max_plausible_spin.setRange(1.0, 2000.0)
         self.max_plausible_spin.setSingleStep(5.0)
@@ -273,7 +279,8 @@ class EODPanel(QWidget):
             "Pulses implying a higher single-fish discharge rate than this "
             "are flagged (✕) as likely EOD→fish assignment errors.")
         self.max_plausible_spin.valueChanged.connect(self._update_suspect_markers)
-        yrow.addWidget(self.max_plausible_spin)
+        pw.addWidget(self.max_plausible_spin)
+        yrow.addWidget(self._plausible_widget)
 
         yrow.addStretch()
         self._yrange_row.setVisible(False)
@@ -286,6 +293,60 @@ class EODPanel(QWidget):
         self.main_plot.setMenuEnabled(False)
         self._ann_vb.dragFinished.connect(self._on_label_drag)
         layout.addWidget(self.main_plot, stretch=3)
+
+        # Frequency mode: one stacked sub-plot per fish (own Y axis each),
+        # X axis linked together and to main_plot so everything scrolls/zooms
+        # in sync regardless of which view is currently visible.
+        self.freq_glw = pg.GraphicsLayoutWidget()
+        self.freq_glw.ci.setSpacing(2)
+        self.freq_glw.ci.setContentsMargins(4, 0, 4, 0)
+        layout.addWidget(self.freq_glw, stretch=3)
+
+        # Items below are created once but added to / removed from their
+        # sub-plot by _render_freq()/_render_dieodi() depending on the
+        # active mode, since each sub-plot switches what it displays.
+        self._freq_plots: list[pg.PlotItem] = []
+        self._freq_vbs: list[_AnnotateViewBox] = []
+        self._freq_markers: list[pg.InfiniteLine] = []
+        self._freq_threshold_lines: list[pg.InfiniteLine] = []
+        self._freq_suspect_scatters: list[pg.ScatterPlotItem] = []
+        self._dieodi_items: list[pg.ScatterPlotItem] = []
+        self._dieodi_zero_lines: list[pg.InfiniteLine] = []
+        for i, (letter, color) in enumerate(zip(FISH_LETTERS, FISH_COLORS)):
+            vb = _AnnotateViewBox()
+            p = self.freq_glw.addPlot(row=i, col=0, viewBox=vb)
+            p.setLabel("left", letter, color=color, **{"font-size": "9pt"})
+            p.getAxis("left").setWidth(40)
+            p.showGrid(x=True, y=True, alpha=0.15)
+            p.setMenuEnabled(False)
+            p.hideButtons()
+            if i < len(FISH_LETTERS) - 1:
+                p.getAxis("bottom").setStyle(showValues=False)
+                p.getAxis("bottom").setHeight(0)
+            else:
+                p.setLabel("bottom", "Time (s)")
+            if i == 0:
+                p.setXLink(self.main_plot)
+            else:
+                p.setXLink(self._freq_plots[0])
+            vb.dragFinished.connect(self._on_label_drag)
+
+            marker = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("#ff5555", width=2))
+            threshold_line = pg.InfiniteLine(
+                pos=170, angle=0, pen=pg.mkPen("#888888", width=1, style=Qt.DashLine))
+            suspect = pg.ScatterPlotItem(
+                symbol="x", size=9, pen=pg.mkPen("#ffffff", width=2), brush=None)
+            dieodi_item = pg.ScatterPlotItem(pen=None, brush=pg.mkBrush(color))
+            zero_line = pg.InfiniteLine(
+                pos=0, angle=0, pen=pg.mkPen("#666688", width=1, style=Qt.DashLine))
+
+            self._freq_plots.append(p)
+            self._freq_vbs.append(vb)
+            self._freq_markers.append(marker)
+            self._freq_threshold_lines.append(threshold_line)
+            self._freq_suspect_scatters.append(suspect)
+            self._dieodi_items.append(dieodi_item)
+            self._dieodi_zero_lines.append(zero_line)
 
         self.ann_track = pg.PlotWidget()
         self.ann_track.setMaximumHeight(46)
@@ -304,12 +365,8 @@ class EODPanel(QWidget):
         layout.addWidget(self.overview_plot, stretch=1)
 
         self._marker = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("#ff5555", width=2))
-        self._threshold_line = pg.InfiniteLine(
-            pos=170, angle=0,
-            pen=pg.mkPen("#888888", width=1, style=Qt.DashLine))
-        self._suspect_scatter = pg.ScatterPlotItem(
-            symbol="x", size=10, pen=pg.mkPen("#ffffff", width=2), brush=None)
         self._freq_cache: dict[str, tuple] = {}
+        self._dieodi_cache: dict[str, tuple] = {}
 
         self._dot_items = []
         self._freq_items = []
@@ -337,9 +394,12 @@ class EODPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _on_toggle_add_label(self, checked: bool) -> None:
+        cursor = Qt.CrossCursor if checked else Qt.ArrowCursor
         self._ann_vb.annotate_mode = checked
-        self.main_plot.viewport().setCursor(
-            Qt.CrossCursor if checked else Qt.ArrowCursor)
+        self.main_plot.viewport().setCursor(cursor)
+        for vb in self._freq_vbs:
+            vb.annotate_mode = checked
+        self.freq_glw.viewport().setCursor(cursor)
 
     def _on_label_drag(self, x0: float, x1: float) -> None:
         if abs(x1 - x0) < 0.02:
@@ -408,7 +468,11 @@ class EODPanel(QWidget):
     def _apply_mode(self) -> None:
         self.main_plot.clear()
         self.main_plot.addItem(self._marker)
-        if self._mode == "dots":
+        is_stacked = self._mode in ("freq", "dieodi")
+        self.main_plot.setVisible(not is_stacked)
+        self.freq_glw.setVisible(is_stacked)
+
+        if not is_stacked:
             for i, letter in enumerate(FISH_LETTERS):
                 t = self._data.fish_event_times[letter]
                 item = self._dot_items[i]
@@ -418,72 +482,153 @@ class EODPanel(QWidget):
             self.main_plot.getAxis("left").setTicks(
                 [[(i, letter) for i, letter in enumerate(FISH_LETTERS)]])
             self.main_plot.setYRange(-0.5, len(FISH_LETTERS) - 0.5)
+            return
+
+        if self._mode == "freq":
+            self._render_freq()
         else:
-            all_freqs = []
-            self._freq_cache = {}
-            for i, letter in enumerate(FISH_LETTERS):
-                t = self._data.fish_event_times[letter]
-                item = self._freq_items[i]
-                if len(t) > 1:
-                    isi = np.diff(t)
-                    freq = np.where(isi > 0, 1.0 / isi, 0.0)
-                    item.setData(t[1:], freq)
-                    all_freqs.append(freq)
-                    self._freq_cache[letter] = (t[1:], freq)
-                else:
-                    item.setData([], [])
-                    self._freq_cache[letter] = (np.array([]), np.array([]))
-                self.main_plot.addItem(item)
-            self.main_plot.addItem(self._threshold_line)
-            self.main_plot.addItem(self._suspect_scatter)
-            self.main_plot.setLabel("left", "Instantaneous freq (Hz)")
-            self.main_plot.getAxis("left").setTicks(None)
-            if not self.lock_y_check.isChecked():
-                if all_freqs:
-                    hi = np.percentile(np.concatenate(all_freqs), 99)
-                else:
-                    hi = 1.0
-                for sp, val in ((self.ymin_spin, 0.0), (self.ymax_spin, max(hi * 1.1, 1.0))):
-                    sp.blockSignals(True)
-                    sp.setValue(val)
-                    sp.blockSignals(False)
-            self._update_freq_yrange()
-            self._update_suspect_markers()
+            self._render_dieodi()
+        self._update_freq_yrange()
+        self._update_suspect_markers()
+
+    def _render_freq(self) -> None:
+        self._freq_cache = {}
+        for i, letter in enumerate(FISH_LETTERS):
+            p = self._freq_plots[i]
+            p.clear()
+            t = self._data.fish_event_times[letter]
+            item = self._freq_items[i]
+            if len(t) > 1:
+                isi = np.diff(t)
+                freq = np.where(isi > 0, 1.0 / isi, 0.0)
+                item.setData(t[1:], freq)
+                self._freq_cache[letter] = (t[1:], freq)
+            else:
+                item.setData([], [])
+                self._freq_cache[letter] = (np.array([]), np.array([]))
+            p.addItem(item)
+            p.addItem(self._freq_markers[i])
+            p.addItem(self._freq_threshold_lines[i])
+            p.addItem(self._freq_suspect_scatters[i])
+
+        if not self.lock_y_check.isChecked():
+            all_freqs = [f for _, f in self._freq_cache.values() if len(f)]
+            hi = np.percentile(np.concatenate(all_freqs), 99) if all_freqs else 1.0
+            self._set_spinboxes(0.0, max(hi * 1.1, 1.0))
+
+    def _render_dieodi(self) -> None:
+        """DIEODI = delta inter-EOD-interval: how much the gap to the next
+        pulse changed vs. the previous gap, per fish. Dot size encodes the
+        actual (current) inter-EOD interval at that point."""
+        self._dieodi_cache = {}
+        for i, letter in enumerate(FISH_LETTERS):
+            p = self._freq_plots[i]
+            p.clear()
+            t = self._data.fish_event_times[letter]
+            item = self._dieodi_items[i]
+            if len(t) > 2:
+                iei = np.diff(t)            # (n-1,) gap ending at each spike
+                dieodi = np.diff(iei)       # (n-2,) change vs. previous gap
+                times_for_points = t[2:]    # aligned to the later spike of each pair
+                current_iei = iei[1:]       # the gap the dieodi value is "for"
+                sizes = self._iei_to_sizes(current_iei)
+                item.setData(times_for_points, dieodi, size=sizes)
+                self._dieodi_cache[letter] = (times_for_points, dieodi)
+            else:
+                item.setData([], [])
+                self._dieodi_cache[letter] = (np.array([]), np.array([]))
+            p.addItem(item)
+            p.addItem(self._freq_markers[i])
+            p.addItem(self._dieodi_zero_lines[i])
+
+        if not self.lock_y_check.isChecked():
+            all_d = [d for _, d in self._dieodi_cache.values() if len(d)]
+            if all_d:
+                allc = np.concatenate(all_d)
+                lim = max(abs(np.percentile(allc, 1)), abs(np.percentile(allc, 99))) * 1.1
+                lim = max(lim, 1e-6)
+            else:
+                lim = 0.05
+            self._set_spinboxes(-lim, lim)
+
+    @staticmethod
+    def _iei_to_sizes(iei: np.ndarray) -> np.ndarray:
+        """Map inter-EOD intervals to marker sizes (px), 5th-95th percentile
+        normalised per fish so outlier gaps don't wash out the scale."""
+        if len(iei) == 0:
+            return np.array([])
+        lo, hi = np.percentile(iei, [5, 95])
+        if hi <= lo:
+            return np.full(len(iei), 8.0)
+        norm = np.clip((iei - lo) / (hi - lo), 0.0, 1.0)
+        return 3.0 + norm * 17.0
+
+    def _set_spinboxes(self, lo: float, hi: float) -> None:
+        for sp, val in ((self.ymin_spin, lo), (self.ymax_spin, hi)):
+            sp.blockSignals(True)
+            sp.setValue(val)
+            sp.blockSignals(False)
+
+    def _apply_freq_autorange(self) -> None:
+        """Each fish's sub-plot auto-scales to its own 99th percentile,
+        independent of the other fish (so one loud spike doesn't squash
+        the others' view)."""
+        for i, letter in enumerate(FISH_LETTERS):
+            _, freq = self._freq_cache.get(letter, (np.array([]), np.array([])))
+            hi = np.percentile(freq, 99) if len(freq) else 1.0
+            self._freq_plots[i].setYRange(0, max(hi * 1.1, 1.0), padding=0)
+
+    def _apply_dieodi_autorange(self) -> None:
+        for i, letter in enumerate(FISH_LETTERS):
+            _, d = self._dieodi_cache.get(letter, (np.array([]), np.array([])))
+            if len(d):
+                lim = max(abs(np.percentile(d, 1)), abs(np.percentile(d, 99))) * 1.1
+                lim = max(lim, 1e-6)
+            else:
+                lim = 0.05
+            self._freq_plots[i].setYRange(-lim, lim, padding=0)
 
     def _update_freq_yrange(self) -> None:
-        if self._mode != "freq":
+        if self._mode not in ("freq", "dieodi"):
             return
-        ymin, ymax = self.ymin_spin.value(), self.ymax_spin.value()
-        if ymax <= ymin:
-            return
-        self.main_plot.setYRange(ymin, ymax, padding=0)
+        if self.lock_y_check.isChecked():
+            ymin, ymax = self.ymin_spin.value(), self.ymax_spin.value()
+            if ymax <= ymin:
+                return
+            for p in self._freq_plots:
+                p.setYRange(ymin, ymax, padding=0)
+        elif self._mode == "freq":
+            self._apply_freq_autorange()
+        else:
+            self._apply_dieodi_autorange()
 
     def _update_suspect_markers(self) -> None:
         if self._mode != "freq":
             return
         thresh = self.max_plausible_spin.value()
-        self._threshold_line.setPos(thresh)
-        xs, ys = [], []
-        for letter in FISH_LETTERS:
+        for i, letter in enumerate(FISH_LETTERS):
+            self._freq_threshold_lines[i].setPos(thresh)
             t, freq = self._freq_cache.get(letter, (np.array([]), np.array([])))
             bad = freq > thresh
             if bad.any():
-                xs.append(t[bad])
-                ys.append(freq[bad])
-        if xs:
-            self._suspect_scatter.setData(np.concatenate(xs), np.concatenate(ys))
-        else:
-            self._suspect_scatter.setData([], [])
+                self._freq_suspect_scatters[i].setData(t[bad], freq[bad])
+            else:
+                self._freq_suspect_scatters[i].setData([], [])
+
+    _MODES = ["dots", "freq", "dieodi"]
 
     def _on_mode_changed(self, idx: int) -> None:
-        self._mode = "dots" if idx == 0 else "freq"
-        self._yrange_row.setVisible(self._mode == "freq")
+        self._mode = self._MODES[idx]
+        self._yrange_row.setVisible(self._mode != "dots")
+        self._plausible_widget.setVisible(self._mode == "freq")
         self._apply_mode()
         self.set_time(self._current_time)
 
     def set_time(self, t: float) -> None:
         self._current_time = t
         self._marker.setPos(t)
+        for m in self._freq_markers:
+            m.setPos(t)
         half = self.window_spin.value() / 2.0
         self.main_plot.setXRange(t - half, t + half, padding=0)
         self._region.blockSignals(True)

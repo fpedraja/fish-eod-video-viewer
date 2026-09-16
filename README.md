@@ -13,11 +13,14 @@ adding behavioral labels to a recording session.
 - **Video + pose overlay** — plays/scrubs the tank video with each fish's
   tracked keypoints (mouth, head, middle, tail) drawn in a per-fish color.
 - **Per-fish EOD timeline** — a scrolling window around the current video
-  frame's time, either as an event raster (one row per fish) or as each
-  fish's own instantaneous discharge frequency (1 / inter-pulse-interval).
-  A red marker line shows exactly where the video currently is, since video
-  (frame-indexed) and EOD pulses (event-timestamped) run on different
-  clocks.
+  frame's time, in one of three views: an event raster (one row per fish),
+  each fish's own instantaneous discharge frequency (1 / inter-pulse-interval,
+  stacked as 4 sub-plots with independent Y axes so one fish's spike can't
+  squash the others), or DIEODI (Δ inter-EOD-interval — how much the gap to
+  the next pulse changed vs. the previous gap, dot size encoding the actual
+  interval). A red marker line shows exactly where the video currently is,
+  since video (frame-indexed) and EOD pulses (event-timestamped) run on
+  different clocks.
 - **Assignment QC** — flags pulses whose implied discharge rate exceeds a
   configurable biological plausibility threshold (default 170 Hz) with a
   marker, since these usually indicate an EOD-to-fish assignment error.
@@ -92,14 +95,17 @@ frame's pose using the nearest frame that does have one.
 ## Controls
 
 - **Play / Pause**, frame slider, frame spinbox — video navigation.
-- **EOD view** — switch between "Event times (dots)" and "Instantaneous
-  frequency".
+- **EOD view** — switch between "Event times (dots)", "Instantaneous
+  frequency" (4 stacked sub-plots, one per fish), and "DIEODI" (Δ inter-EOD-
+  interval, dot size = the actual interval).
 - **Window (s)** — width of the scrolling EOD timeline around the current
   frame.
-- **Lock Y range (Hz)** — pin the frequency plot's Y axis instead of
-  auto-scaling to the 99th percentile each redraw.
-- **Max plausible (Hz)** — discharge-rate threshold above which a pulse is
-  flagged as a likely assignment error (✕ marker + dashed reference line).
+- **Lock Y range** — pin every fish's sub-plot to the same Y range (Hz for
+  frequency, seconds for DIEODI) instead of each auto-scaling independently
+  to its own 1st–99th percentile.
+- **Max plausible (Hz)** — frequency-view only: discharge-rate threshold
+  above which a pulse is flagged as a likely assignment error (✕ marker +
+  dashed reference line).
 - **🏷 Add Label** — toggle on, then drag a range on the EOD timeline to tag
   it. Pick an existing label or type a new one. Labels are listed on the
   right (double-click to jump to one, or delete it) and auto-saved to
